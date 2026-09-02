@@ -74,5 +74,3 @@ DLSS5.exe -uninstall "C:\Games\YourGame\Game.exe"
 - 格式化：`gofmt -w .`
 - 静态检查：`go vet ./...`
 - 单元测试：`go test ./...`
-
-如果需要，我可以为仓库添加 CONTRIBUTING.md、ISSUE 模板或 LICENSE。
