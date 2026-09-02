@@ -315,6 +315,10 @@ func ensureReshadeAppsEntry(gameExe string) {
 		logf("OK", "ReShadeApps.ini 已包含本游戏")
 		return
 	}
+	// F-09：修改前备份原始名单，卸载时优先还原
+	if bak := appsIni + iniBackupSuffix; !fileExists(bak) {
+		copyFile(appsIni, bak)
+	}
 	if os.WriteFile(appsIni, []byte(content), 0o644) != nil {
 		// 尝试追加写入（ACL 通常只允许管理员写）
 		if err := appendReshadeApps(appsIni, gameExe); err != nil {
@@ -331,14 +335,22 @@ func ensureReshadeAppsEntry(gameExe string) {
 }
 
 func appendReshadeApps(appsIni, gameExe string) error {
-	// 经由提权 PowerShell 追加（会弹一次 UAC，用户确认即可）
+	// F-04：脚本正文为纯静态 ASCII 文本，两个路径经环境变量传入，杜绝单引号拼接注入
+	//（原实现在提权上下文里用 '%s' 拼路径，路径含单引号即可注入任意 PS 语句）
 	ps := filepath.Join(logsDir, "reshade_apps_append.ps1")
-	script := fmt.Sprintf("$p='%s'\r\n$c=(Get-Content -Raw $p).TrimEnd()+',%s'\r\n[IO.File]::WriteAllText($p,$c,(New-Object Text.UTF8Encoding $true))\r\n", appsIni, gameExe)
-	if err := os.WriteFile(ps, []byte("\ufeff"+script), 0o644); err != nil {
+	script := "$c=(Get-Content -Raw $env:DLSS5_APPS_INI).TrimEnd()+','+$env:DLSS5_GAME_EXE\r\n" +
+		"[IO.File]::WriteAllText($env:DLSS5_APPS_INI,$c,(New-Object Text.UTF8Encoding $true))\r\n"
+	if err := os.WriteFile(ps, []byte(script), 0o644); err != nil {
 		return err
 	}
-	return exec.Command("powershell", "-NoProfile", "-Command",
-		"Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','"+ps+"'").Run()
+	cmd := exec.Command("powershell", "-NoProfile", "-Command",
+		"Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',$env:DLSS5_PS1")
+	cmd.Env = append(os.Environ(),
+		"DLSS5_PS1="+ps,
+		"DLSS5_APPS_INI="+appsIni,
+		"DLSS5_GAME_EXE="+gameExe,
+	)
+	return cmd.Run()
 }
 
 // ============ 清单 ============
@@ -361,6 +373,18 @@ func relRecord(gameDir, p string) string {
 }
 
 // ============ 主安装入口 ============
+const iniBackupSuffix = ".dlss5bak"
+
+// F-09：合并写入前备份用户原始配置；卸载时优先还原备份而非盲目删键
+func backupOriginalIni(path string) {
+	bak := path + iniBackupSuffix
+	if fileExists(path) && !fileExists(bak) {
+		if err := copyFile(path, bak); err == nil {
+			logf("INFO", "已备份用户原始配置: %s", filepath.Base(bak))
+		}
+	}
+}
+
 func installGameRoute(a *analysis, c *comps) (*manifestData, error) {
 	gameDir := a.ExeDir
 	gameExe := a.ExePath
@@ -371,7 +395,7 @@ func installGameRoute(a *analysis, c *comps) (*manifestData, error) {
 
 	logf("STEP", "开始安装 · 路由 [%s] · %s", route, a.GameName)
 
-	// ---------- ReShade 本体 ----------
+	// ---------- 已装 ReShade 检测（提前计算，供预检与后续使用） ----------
 	hasGoodReShade := false
 	for _, d := range reshadeProbeDlls {
 		ok, _, maj, min, _ := isReShadeDll(filepath.Join(gameDir, d))
@@ -380,12 +404,53 @@ func installGameRoute(a *analysis, c *comps) (*manifestData, error) {
 			break
 		}
 	}
+
+	// ---------- Generic Depth 补扫（预检前）：此前交互式 ReShade 安装可能已附带装好 ----------
+	for _, arch := range []string{"addon64", "addon32"} {
+		key := "generic_depth_" + arch
+		if c.Files[key] == "" {
+			if p := filepath.Join(gameDir, "generic_depth."+arch); fileExists(p) {
+				c.Files[key] = p
+				logf("OK", "  从游戏目录补获 generic_depth.%s", arch)
+			}
+		}
+	}
+
+	// ---------- F-07：路由级预检（关键文件缺失直接失败，杜绝静默残缺安装） ----------
+	addon := "dlss5-feed.addon64"
+	if is32 {
+		addon = "dlss5-feed.addon32"
+	}
+	var preMissing []string
+	reqFile := func(key, desc string) {
+		if p := c.Files[key]; p == "" || !fileExists(p) {
+			preMissing = append(preMissing, desc)
+		}
+	}
+	reqFile(addon, addon+"（Feeder 本体）")
+	reqFile("DLSS5_Feed.fx", "DLSS5_Feed.fx（Feeder 着色器）")
+	if is32 {
+		reqFile("generic_depth_addon32", "generic_depth.addon32（深度采集）")
+	} else {
+		reqFile("generic_depth_addon64", "generic_depth.addon64（深度采集）")
+	}
+	if is32 || route == "d3d9" {
+		reqFile("host64exe", "host64\\dlss5-feed-host64.exe")
+	}
+	if route == "d3d9" && (c.DgvRoot == "" || !dirExists(c.DgvRoot)) {
+		preMissing = append(preMissing, "dgVoodoo2 包（D3D9 转译层）")
+	}
+	if !hasGoodReShade && (c.Files["reshade_setup"] == "" || !fileExists(c.Files["reshade_setup"])) {
+		preMissing = append(preMissing, "ReShade 安装器")
+	}
+	if len(preMissing) > 0 {
+		return nil, fmt.Errorf("关键组件缺失，安装中止：%s\n请把对应文件放进工具目录 components\\ 后重试", strings.Join(preMissing, "；"))
+	}
+
+	// ---------- ReShade 本体 ----------
 	if hasGoodReShade {
 		logf("OK", "已有 ReShade ≥6.8，跳过本体安装")
 	} else {
-		if c.Files["reshade_setup"] == "" {
-			return nil, fmt.Errorf("缺少 ReShade 安装器，无法继续")
-		}
 		api := "d3d11"
 		switch route {
 		case "d3d64", "d3d32":
@@ -421,6 +486,17 @@ func installGameRoute(a *analysis, c *comps) (*manifestData, error) {
 			}
 		} else {
 			logf("OK", "ReShade 本体就绪")
+		}
+	}
+
+	// ---------- Generic Depth 补扫（安装后）：本次交互式安装若附带装了 Generic Depth 则回收 ----------
+	for _, arch := range []string{"addon64", "addon32"} {
+		key := "generic_depth_" + arch
+		if c.Files[key] == "" {
+			if p := filepath.Join(gameDir, "generic_depth."+arch); fileExists(p) {
+				c.Files[key] = p
+				logf("OK", "  从游戏目录补获 generic_depth.%s（ReShade 安装器附带）", arch)
+			}
 		}
 	}
 
@@ -465,6 +541,11 @@ func installGameRoute(a *analysis, c *comps) (*manifestData, error) {
 		writeTextBOM(iniPath, reshadeIniContent(gameDir, vulkan, d3d9, false))
 		allInstalled = append(allInstalled, "ReShade.ini")
 	} else {
+		// F-09：合并前备份用户原始 ReShade.ini，卸载时还原而非删键
+		backupOriginalIni(iniPath)
+		if fileExists(iniPath + iniBackupSuffix) {
+			allInstalled = append(allInstalled, "ReShade.ini"+iniBackupSuffix)
+		}
 		keys := map[string]string{
 			"EffectSearchPaths":  gameDir + `\reshade-shaders\Shaders\**`,
 			"TextureSearchPaths": gameDir + `\reshade-shaders\Textures\**`,
@@ -483,6 +564,10 @@ func installGameRoute(a *analysis, c *comps) (*manifestData, error) {
 		writeTextBOM(presetPath, reshadePresetContent(3))
 		allInstalled = append(allInstalled, "ReShadePreset.ini")
 	} else {
+		backupOriginalIni(presetPath)
+		if fileExists(presetPath + iniBackupSuffix) {
+			allInstalled = append(allInstalled, "ReShadePreset.ini"+iniBackupSuffix)
+		}
 		iniSetKeys(presetPath, "DLSS5_Feed.fx", map[string]string{"PreprocessorDefinitions": "DLSS5_MV_PROVIDER=3"})
 		allInstalled = append(allInstalled, "ReShadePreset.ini(合并)")
 	}
@@ -535,21 +620,29 @@ func newGameShortcut(a *analysis) (string, error) {
 			workdir = a.ExeDir
 		}
 	}
-	// 写临时 ps1 避免 -Command 转义地狱
+	// F-04：脚本正文为静态模板，四个字段经环境变量传入，杜绝单引号拼接注入；
+	// 内容含中文，保留 UTF-8 BOM 以兼容 Windows PowerShell 5.1
 	ps := filepath.Join(logsDir, "make_shortcut.ps1")
-	script := fmt.Sprintf(`
+	script := `
 $ws = New-Object -ComObject WScript.Shell
-$s = $ws.CreateShortcut('%s')
-$s.TargetPath = '%s'
-$s.Arguments = '%s'
-$s.WorkingDirectory = '%s'
+$s = $ws.CreateShortcut($env:DLSS5_LNK)
+$s.TargetPath = $env:DLSS5_TARGET
+$s.Arguments = $env:DLSS5_ARGS
+$s.WorkingDirectory = $env:DLSS5_WORKDIR
 $s.Description = '通过 DLSS5-Feeder 启动（DLSS5 一键开启工具创建）'
 $s.Save()
-`, lnkPath, target, args, workdir)
+`
 	if err := os.WriteFile(ps, []byte("\ufeff"+script), 0o644); err != nil {
 		return "", err
 	}
-	if err := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps).Run(); err != nil {
+	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps)
+	cmd.Env = append(os.Environ(),
+		"DLSS5_LNK="+lnkPath,
+		"DLSS5_TARGET="+target,
+		"DLSS5_ARGS="+args,
+		"DLSS5_WORKDIR="+workdir,
+	)
+	if err := cmd.Run(); err != nil {
 		return "", err
 	}
 	logf("OK", "桌面启动器已创建: %s", lnkPath)

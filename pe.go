@@ -5,6 +5,7 @@ package main
 import (
 	"encoding/binary"
 	"os"
+	"regexp"
 	"strings"
 )
 
@@ -22,6 +23,16 @@ var knownImports = []string{
 	"dxgi.dll", "vulkan-1.dll", "opengl32.dll",
 	"dxvk_d3d9.dll", "dxvk_d3d11.dll",
 }
+
+// F-12：要求 DLL 名前存在非单词字符边界，降低数据段巧合同名子串造成的误报
+// （如 myd3d11.dll 不再命中 d3d11.dll）；导入名前通常为 NUL/边界字符
+var importNameRes = func() []*regexp.Regexp {
+	res := make([]*regexp.Regexp, len(knownImports))
+	for i, k := range knownImports {
+		res[i] = regexp.MustCompile(`(?:^|[^a-z0-9_.])` + regexp.QuoteMeta(k))
+	}
+	return res
+}()
 
 func parsePe(exePath string) peInfo {
 	info := peInfo{Path: exePath, Bitness: "unknown"}
@@ -70,8 +81,8 @@ func parsePe(exePath string) peInfo {
 		copy(buf, hdr)
 	}
 	ascii := strings.ToLower(string(buf))
-	for _, k := range knownImports {
-		if strings.Contains(ascii, k) {
+	for i, k := range knownImports {
+		if importNameRes[i].MatchString(ascii) {
 			info.Imports = append(info.Imports, strings.ToLower(k))
 		}
 	}

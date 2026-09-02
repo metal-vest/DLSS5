@@ -64,7 +64,8 @@ func getEnvironmentReport() *envReport {
 	// ---- 2. 驱动版本（nvidia-smi）----
 	smi := filepath.Join(os.Getenv("WINDIR"), "System32", "nvidia-smi.exe")
 	if fileExists(smi) {
-		out, err := runPS("& '" + smi + "' --query-gpu=driver_version --format=csv,noheader | Select-Object -First 1")
+		// F-04：路径经环境变量传入，不拼进脚本字符串
+		out, err := runPS("& $env:DLSS5_SMI --query-gpu=driver_version --format=csv,noheader | Select-Object -First 1", "DLSS5_SMI="+smi)
 		if err == nil && out != "" {
 			dv := strings.TrimSpace(strings.Split(out, "\n")[0])
 			r.DriverVersion = dv

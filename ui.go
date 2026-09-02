@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"unicode/utf8"
 
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
@@ -137,6 +138,13 @@ func runGUI() {
 			walk.MsgBox(g.mw, title, text, style)
 		})
 	}
+	uiConfirmFn = func(title, text string) bool {
+		var yes bool
+		g.mw.Synchronize(func() {
+			yes = walk.MsgBox(g.mw, title, text, walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) == walk.DlgCmdYes
+		})
+		return yes
+	}
 
 	g.appendLog(fmt.Sprintf("DLSS5 一键开启工具(Go 原生版) v%s", toolVersion))
 	g.appendLog("组件获取链路：cache 缓存 → components 手动投递 → 本机游戏扫描 → 社区镜像在线下载")
@@ -148,7 +156,12 @@ func (g *gui) appendLog(line string) {
 	const cap = 80 * 1024
 	cur := g.teLog.Text()
 	if len(cur) > cap {
-		cur = cur[len(cur)/2:]
+		// 附加修复：截断点对齐到 UTF-8 字符边界，避免切碎多字节字符产生乱码首行
+		cut := len(cur) / 2
+		for cut < len(cur) && !utf8.RuneStart(cur[cut]) {
+			cut++
+		}
+		cur = cur[cut:]
 		if i := strings.Index(cur, "\r\n"); i > 0 {
 			cur = cur[i+2:]
 		}
