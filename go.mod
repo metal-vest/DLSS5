@@ -1,6 +1,6 @@
 module dlss5feeder
 
-go 1.22.5
+go 1.23
 
 require (
 	github.com/lxn/walk v0.0.0-20210112085537-c389da54e794 // indirect
