@@ -310,7 +310,7 @@ func ensureReshadeAppsEntry(gameExe string) {
 	if err != nil {
 		return
 	}
-	content := string(data)
+	content := stripBOM(string(data))
 	if strings.Contains(content, gameExe) {
 		logf("OK", "ReShadeApps.ini 已包含本游戏")
 		return

@@ -1,3 +1,5 @@
+//go:build windows
+
 // ui.go — 原生 Win32 图形界面（lxn/walk）
 package main
 

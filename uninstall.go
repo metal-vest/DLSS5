@@ -105,7 +105,7 @@ func uninstallGame(gameExe string) (int, error) {
 				}
 			} else if data, err := os.ReadFile(appsIni); err == nil {
 				// 无备份（旧版本安装）时逐行摘除本游戏
-				content := string(data)
+				content := stripBOM(string(data))
 				if strings.Contains(content, gameExe) {
 					lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
 					var out []string

@@ -1,3 +1,5 @@
+//go:build windows
+
 // winver.go — 通过 version.dll 读取 PE 版本资源（ReShade / DXVK 识别）
 //
 // 安全修复（F-08）：原实现把版本资源缓冲放在包级全局变量且无锁，
