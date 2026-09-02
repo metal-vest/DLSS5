@@ -1,0 +1,55 @@
+# goreleaser configuration for DLSS5
+# This file is used by goreleaser to build cross-platform binaries and produce archives
+# The slsa-github-generator reusable workflow will call goreleaser according to .slsa-goreleaser.yml
+
+project_name: dlss5
+
+builds:
+  - id: dlss5
+    main: .
+    binary: dlss5
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    hooks:
+      pre: []
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+
+archives:
+  - id: tar
+    builds:
+      - dlss5
+    format: tar.gz
+    files:
+      - LICENSE
+      - README*
+  - id: zip
+    builds:
+      - dlss5
+    format: zip
+    files:
+      - LICENSE
+      - README*
+
+checksum:
+  name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
+
+snapshot:
+  name_template: "{{ .Tag }}-next"
+
+changelog:
+  use: git
+
+release:
+  github:
+    owner: metal-vest
+    name: DLSS5
+    draft: false
+    prerelease: false
