@@ -1,0 +1,50 @@
+# .slsa-goreleaser.yml
+# SLSA + GoReleaser configuration for DLSS5
+# 基本说明：
+# - 由 slsa-framework/slsa-github-generator 的 reusable workflow 使用来生成 provenance 并调用 goreleaser 构建/发布
+# - 根据你的需要调整 go-version、goreleaser.version、以及签名相关的 secrets
+
+goreleaser:
+  # 指定 goreleaser 版本以保证可复现性（可按需更新）
+  version: v1.22.0
+  # 指向仓库中的 goreleaser 配置文件（如果你把配置文件命名为其他名字请修改）
+  config-file: .goreleaser.yml
+
+# 构建相关设置（会传递给可复用工作流）
+build:
+  # 建议与项目使用的 Go 版本保持一致，默认示例使用 1.20
+  go-version: 1.20
+
+provenance:
+  # 是否启用 SLSA provenance 生成（SLSA v1 predicate）
+  enabled: true
+  # 输出 provenance 文件的目录（相对于仓库根目录）
+  output-path: ./provenance
+  # 记录构建使用的材料（可选）
+  materials:
+    - path: .
+  # 构建器信息（可选，但推荐保留以便追踪）
+  builder:
+    id: "https://github.com/slsa-framework/slsa-github-generator"
+    version: "v1.4.0"
+  predicate-type: "https://slsa.dev/provenance/v1"
+
+# 签名设置（如果需要对构建产物或 provenance 进行签名）
+signing:
+  # 如果你希望使用签名，请设置为 true，并在 GitHub Secrets 中配置相应 key
+  enabled: false
+  # 示例：使用环境变量或 GitHub Secrets 引用（如果启用，请在 workflow 中传入 secrets）
+  # key: ${{ secrets.SLSA_SIGNING_KEY }}
+  # key-id: "your-key-id"
+
+# 可选：自定义 goreleaser 配置片段覆盖（如果需要）
+# extra:
+#   artifacts:
+#     - name: dlss5
+#       path: ./dist/dlss5
+
+# 使用说明：
+# 1) 将此文件放在仓库根目录（.slsa-goreleaser.yml）。
+# 2) 确保仓库根目录存在 .goreleaser.yml（GoReleaser 主配置），或修改上面 goreleaser.config-file 指向实际文件名。
+# 3) 在 .github/workflows/go-ossf-slsa3-publish.yml 中，确保传入的 go-version 与此处一致（可选）。
+# 4) 如需启用签名，把 signing.enabled 设为 true，并在仓库 Secrets 中添加相应密钥（例如 SLSA_SIGNING_KEY）。
