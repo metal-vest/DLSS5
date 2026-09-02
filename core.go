@@ -1,0 +1,545 @@
+// core.go — DLSS5 一键开启工具（Go 原生版）· 基础工具库
+// 移植自 pkg/tools/core.ps1（PS1 原型），逻辑保持一致
+package main
+
+import (
+	"archive/zip"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+)
+
+const toolVersion = "2.0.0"
+
+// ============ 全局状态 ============
+var (
+	rootDir  string // 工具根目录（exe 所在目录，不可写时回退 %LOCALAPPDATA%）
+	cacheDir string // 下载缓存
+	compDir  string // 手动投递组件目录
+	logsDir  string // 日志目录
+	logFile  string // 当前日志文件
+
+	// UI 钩子（由 ui.go 注入，已做跨线程封送；静默模式为 nil）
+	uiLogFn      func(line string)
+	uiProgressFn func(pct int, label string) // pct==-1 表示不确定进度
+	uiStatusFn   func(text string, kind string)
+	uiMsgBoxFn   func(title, text string, warn bool)
+)
+
+func initDirs(exeDir string) {
+	rootDir = strings.TrimRight(exeDir, `\`)
+	cacheDir = filepath.Join(rootDir, "cache")
+	compDir = filepath.Join(rootDir, "components")
+	logsDir = filepath.Join(rootDir, "logs")
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		// exe 目录不可写（如 Program Files）→ 回退用户目录
+		rootDir = filepath.Join(os.Getenv("LOCALAPPDATA"), "DLSS5Feeder")
+		cacheDir = filepath.Join(rootDir, "cache")
+		compDir = filepath.Join(rootDir, "components")
+		logsDir = filepath.Join(rootDir, "logs")
+		os.MkdirAll(cacheDir, 0o755)
+	}
+	os.MkdirAll(compDir, 0o755)
+	os.MkdirAll(logsDir, 0o755)
+	logFile = filepath.Join(logsDir, "oneclick-"+time.Now().Format("20060102-150405")+".log")
+	logLine("INFO", fmt.Sprintf("DLSS5 一键开启工具(Go 原生版) v%s · 根目录: %s", toolVersion, rootDir))
+}
+
+// ============ 日志 ============
+func logLine(level, msg string) string {
+	line := fmt.Sprintf("[%s] [%-5s] %s", time.Now().Format("15:04:05"), level, msg)
+	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err == nil {
+		f.WriteString(line + "\r\n")
+		f.Close()
+	}
+	if uiLogFn != nil {
+		uiLogFn(line)
+	}
+	return line
+}
+
+func logf(level, format string, a ...interface{}) { logLine(level, fmt.Sprintf(format, a...)) }
+
+func setProgress(pct int, label string) {
+	if uiProgressFn != nil {
+		uiProgressFn(pct, label)
+	}
+}
+
+func setStatus(text, kind string) {
+	logLine("INFO", text)
+	if uiStatusFn != nil {
+		uiStatusFn(text, kind)
+	}
+}
+
+// ============ UTF-8 BOM 写入（ReShade 配置习惯） ============
+func writeTextBOM(path, text string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	f.Write([]byte{0xEF, 0xBB, 0xBF})
+	_, err = f.WriteString(text)
+	return err
+}
+
+// ============ INI 读写（保留其他节的原样合并） ============
+func iniSetKeys(path, section string, keys map[string]string) {
+	var lines []string
+	if data, err := os.ReadFile(path); err == nil {
+		raw := strings.ReplaceAll(string(data), "\r\n", "\n")
+		raw = strings.ReplaceAll(raw, "\r", "\n")
+		lines = strings.Split(raw, "\n")
+		if len(lines) > 0 && lines[len(lines)-1] == "" {
+			lines = lines[:len(lines)-1]
+		}
+	}
+
+	// 先写"[section] 内已存在的键"（原位替换），再决定追加位置
+	written := map[string]bool{}
+	inSection := false
+	sectionExists := false
+	var out []string
+	for _, line := range lines {
+		t := strings.TrimSpace(line)
+		if sectRe.MatchString(t) {
+			m := sectRe.FindStringSubmatch(t)
+			isTarget := strings.EqualFold(strings.TrimSpace(m[1]), section)
+			if isTarget {
+				sectionExists = true
+			}
+			if inSection && !isTarget {
+				// 上一个节结束：补齐未写键
+				for k, v := range keys {
+					if !written[k] {
+						out = append(out, k+"="+v)
+						written[k] = true
+					}
+				}
+			}
+			inSection = isTarget
+			out = append(out, line)
+			continue
+		}
+		if inSection && kvRe.MatchString(t) {
+			m := kvRe.FindStringSubmatch(t)
+			k := strings.TrimSpace(m[1])
+			for target, v := range keys {
+				if strings.EqualFold(k, target) {
+					out = append(out, target+"="+v)
+					written[target] = true
+					goto next
+				}
+			}
+		}
+		out = append(out, line)
+	next:
+	}
+	if !sectionExists {
+		out = append(out, "["+section+"]")
+		for k, v := range keys {
+			out = append(out, k+"="+v)
+			written[k] = true
+		}
+	} else if inSection {
+		for k, v := range keys {
+			if !written[k] {
+				out = append(out, k+"="+v)
+				written[k] = true
+			}
+		}
+	}
+	writeTextBOM(path, strings.Join(out, "\r\n")+"\r\n")
+}
+
+var sectRe = regexp.MustCompile(`^\[(.+)\]$`)
+var kvRe = regexp.MustCompile(`^([^=;#]+)=`)
+
+func iniRemoveKeys(path, section string, keyNames []string) {
+	if !fileExists(path) {
+		return
+	}
+	data, _ := os.ReadFile(path)
+	raw := strings.ReplaceAll(string(data), "\r\n", "\n")
+	raw = strings.ReplaceAll(raw, "\r", "\n")
+	var out []string
+	inSection := false
+	for _, line := range strings.Split(raw, "\n") {
+		t := strings.TrimSpace(line)
+		if sectRe.MatchString(t) {
+			m := sectRe.FindStringSubmatch(t)
+			inSection = strings.EqualFold(strings.TrimSpace(m[1]), section)
+			out = append(out, line)
+			continue
+		}
+		if inSection && kvRe.MatchString(t) {
+			m := kvRe.FindStringSubmatch(t)
+			k := strings.TrimSpace(m[1])
+			remove := false
+			for _, n := range keyNames {
+				if strings.EqualFold(n, k) {
+					remove = true
+					break
+				}
+			}
+			if remove {
+				continue
+			}
+		}
+		out = append(out, line)
+	}
+	writeTextBOM(path, strings.Join(out, "\r\n")+"\r\n")
+}
+
+// ============ 下载（带重试/UA/缓存/进度） ============
+func download(url, outFile string, retries int, label string) bool {
+	if fileExists(outFile) {
+		logf("OK", "缓存命中: %s", label)
+		return true
+	}
+	tmp := outFile + ".downloading"
+	os.Remove(tmp)
+	client := &http.Client{Timeout: 0}
+	for i := 1; i <= retries; i++ {
+		logf("INFO", "下载 %s（第 %d/%d 次）", label, i, retries)
+		setProgress(-1, "下载 "+label)
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			logf("ERROR", "下载失败: %s · %v", label, err)
+			continue
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) DLSS5-OneClick-Go")
+		resp, err := client.Do(req)
+		if err != nil {
+			logf("ERROR", "下载失败: %s · %v", label, err)
+			if i < retries {
+				time.Sleep(time.Duration(2*i) * time.Second)
+			}
+			continue
+		}
+		if resp.StatusCode != 200 {
+			resp.Body.Close()
+			logf("ERROR", "下载失败: %s · HTTP %d", label, resp.StatusCode)
+			if i < retries {
+				time.Sleep(time.Duration(2*i) * time.Second)
+			}
+			continue
+		}
+		total := resp.ContentLength
+		f, err := os.Create(tmp)
+		if err != nil {
+			resp.Body.Close()
+			logf("ERROR", "无法写入 %s: %v", tmp, err)
+			continue
+		}
+		var done int64
+		buf := make([]byte, 256*1024)
+		lastReport := time.Now()
+		for {
+			n, rerr := resp.Body.Read(buf)
+			if n > 0 {
+				f.Write(buf[:n])
+				done += int64(n)
+				if time.Since(lastReport) > 300*time.Millisecond {
+					lastReport = time.Now()
+					if total > 0 {
+						setProgress(int(done*100/total), fmt.Sprintf("下载 %s · %s / %s", label, humanBytes(done), humanBytes(total)))
+					} else {
+						setProgress(-1, fmt.Sprintf("下载 %s · %s", label, humanBytes(done)))
+					}
+				}
+			}
+			if rerr != nil {
+				break
+			}
+		}
+		f.Close()
+		resp.Body.Close()
+		st, _ := os.Stat(tmp)
+		if st == nil || st.Size() < 1 {
+			logf("ERROR", "下载内容为空: %s", label)
+			continue
+		}
+		os.Remove(outFile)
+		if err := os.Rename(tmp, outFile); err != nil {
+			copyFile(tmp, outFile)
+			os.Remove(tmp)
+		}
+		setProgress(0, "")
+		logf("OK", "完成: %s (%s)", label, humanBytes(st.Size()))
+		return true
+	}
+	os.Remove(tmp)
+	return false
+}
+
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1024*1024*1024:
+		return fmt.Sprintf("%.2f GB", float64(n)/(1024*1024*1024))
+	case n >= 1024*1024:
+		return fmt.Sprintf("%.1f MB", float64(n)/(1024*1024))
+	case n >= 1024:
+		return fmt.Sprintf("%.0f KB", float64(n)/1024)
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
+}
+
+// ============ GitHub 最新 tag 探测（releases/latest 302 Location，避开 api.github.com 限流） ============
+var tagLocRe = regexp.MustCompile(`/tag/(.+)$`)
+
+func latestTag(repo string) string {
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	req, err := http.NewRequest("GET", "https://github.com/"+repo+"/releases/latest", nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("User-Agent", "DLSS5-OneClick-Go")
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	loc := resp.Header.Get("Location")
+	if loc != "" {
+		if m := tagLocRe.FindStringSubmatch(loc); m != nil {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+// ============ GitHub expanded_assets 资产解析 ============
+func githubAssetURL(repo, tag, assetRegex string) string {
+	client := &http.Client{Timeout: 20 * time.Second}
+	url := fmt.Sprintf("https://github.com/%s/releases/expanded_assets/%s", repo, tag)
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 DLSS5-OneClick-Go")
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	re, err := regexp.Compile(assetRegex)
+	if err != nil {
+		return ""
+	}
+	m := re.FindSubmatch(body)
+	if m == nil {
+		return ""
+	}
+	p := strings.Trim(string(m[1]), `"'`)
+	if strings.HasPrefix(p, "http") {
+		return p
+	}
+	return "https://github.com" + p
+}
+
+// ============ ZIP 安全解压 ============
+func expandZip(zipPath, destDir string) error {
+	os.RemoveAll(destDir)
+	os.MkdirAll(destDir, 0o755)
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	for _, f := range r.File {
+		name := filepath.FromSlash(f.Name)
+		if strings.Contains(name, "..") {
+			continue // 路径穿越防护
+		}
+		target := filepath.Join(destDir, name)
+		if f.FileInfo().IsDir() {
+			os.MkdirAll(target, 0o755)
+			continue
+		}
+		os.MkdirAll(filepath.Dir(target), 0o755)
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
+		out, err := os.Create(target)
+		if err != nil {
+			rc.Close()
+			continue
+		}
+		io.Copy(out, rc)
+		out.Close()
+		rc.Close()
+	}
+	return nil
+}
+
+// ============ 通用文件操作 ============
+func fileExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
+}
+
+func dirExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && st.IsDir()
+}
+
+func ensureDir(p string) { os.MkdirAll(p, 0o755) }
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	os.MkdirAll(filepath.Dir(dst), 0o755)
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	return err
+}
+
+// Source 允许为空（组件缺失时静默跳过）
+func copyIfExists(src, destDir, newName string) bool {
+	if src != "" && fileExists(src) {
+		name := newName
+		if name == "" {
+			name = filepath.Base(src)
+		}
+		return copyFile(src, filepath.Join(destDir, name)) == nil
+	}
+	return false
+}
+
+func sha256sum(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	h := sha256.New()
+	io.Copy(h, f)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// 在父目录（含子目录，深度限制）中查找同名文件，返回最近修改的第一个
+func findFileRecursive(rootDir, fileName string, maxDepth int) string {
+	if !dirExists(rootDir) {
+		return ""
+	}
+	baseDepth := strings.Count(strings.TrimRight(rootDir, `\`), string(os.PathSeparator)) + 1
+	var hits []string
+	filepath.WalkDir(rootDir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		depth := strings.Count(p, string(os.PathSeparator)) + 1
+		if d.IsDir() {
+			if depth > baseDepth+maxDepth {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.EqualFold(filepath.Base(p), fileName) && depth <= baseDepth+maxDepth {
+			hits = append(hits, p)
+		}
+		return nil
+	})
+	if len(hits) == 0 {
+		return ""
+	}
+	type dated struct {
+		p string
+		t time.Time
+	}
+	var ds []dated
+	for _, p := range hits {
+		st, err := os.Stat(p)
+		t := time.Time{}
+		if err == nil {
+			t = st.ModTime()
+		}
+		ds = append(ds, dated{p, t})
+	}
+	sort.Slice(ds, func(i, j int) bool { return ds[i].t.After(ds[j].t) })
+	return ds[0].p
+}
+
+// 从"本机已有 DLSS 游戏 / Steam 库"中提取 nvngx_dlss.dll
+func findLocalNvNgx() string {
+	var roots []string
+	seen := map[string]bool{}
+	addRoot := func(p string) {
+		if p != "" && dirExists(p) && !seen[p] {
+			seen[p] = true
+			roots = append(roots, p)
+		}
+	}
+	// libraryfolders.vdf 解析
+	candidates := []string{
+		filepath.Join(os.Getenv("ProgramFiles(x86)"), "Steam", "steamapps"),
+		filepath.Join(os.Getenv("ProgramFiles"), "Steam", "steamapps"),
+	}
+	vdfRe := regexp.MustCompile(`"path"\s+"([^"]+)"`)
+	for _, lib := range candidates {
+		vdf := filepath.Join(lib, "libraryfolders.vdf")
+		if data, err := os.ReadFile(vdf); err == nil {
+			for _, m := range vdfRe.FindAllStringSubmatch(string(data), -1) {
+				p := strings.ReplaceAll(m[1], `\\`, `\`)
+				addRoot(filepath.Join(p, "steamapps", "common"))
+			}
+		}
+	}
+	for _, drv := range []string{"C:", "D:", "E:", "F:", "G:"} {
+		addRoot(drv + `\SteamLibrary\steamapps\common`)
+	}
+	for _, r := range roots {
+		hit := findFileRecursive(r, "nvngx_dlss.dll", 3)
+		if hit != "" {
+			logf("OK", "在本机找到 nvngx_dlss.dll: %s", hit)
+			return hit
+		}
+	}
+	return ""
+}
+
+// ============ PowerShell 助手 ============
+func runPS(script string) (string, error) {
+	out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script).Output()
+	return strings.TrimSpace(string(out)), err
+}
+
+// 静默运行外部程序，返回退出码
+func runExe(path string, args ...string) int {
+	cmd := exec.Command(path, args...)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	err := cmd.Run()
+	if err == nil {
+		return 0
+	}
+	if ee, ok := err.(*exec.ExitError); ok {
+		return ee.ExitCode()
+	}
+	return -1
+}
